@@ -1,17 +1,37 @@
-import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit
-from geopy.geocoders import Nominatim
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog
+from selenium.common.exceptions import NoSuchElementException
+from PyQt5.QtCore import QCoreApplication, QThread  # 추가
 from selenium import webdriver
+import sys
+import pandas as pd
 import time
 import math
+
+
+class WebScraperThread(QThread):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.stop_requested = False  # 추가된 부분
+
+    def run(self):
+        self.app.search_libraries()
+
+    def stop(self):
+        self.stop_requested = True
+        if self.app.driver:  # 추가된 부분
+            self.app.driver.quit()
+            self.app.driver = None
 
 
 class LibrarySearchApp(QWidget):
     def __init__(self):
         super().__init__()
-
+        self.web_scraper_thread = None  # 추가
         self.result_text = QTextEdit()
         self.search_button = QPushButton("검색")
+        self.stop_button = QPushButton("중지")
+        self.quit_button = QPushButton("종료")
         self.location_input = QLineEdit()
         self.location_label = QLabel("일반 도서:")
         self.initUI()
@@ -24,7 +44,13 @@ class LibrarySearchApp(QWidget):
         layout.addWidget(self.location_input)
 
         layout.addWidget(self.search_button)
-        self.search_button.clicked.connect(self.search_libraries)
+        self.search_button.clicked.connect(self.start_search)
+
+        layout.addWidget(self.stop_button)
+        self.stop_button.clicked.connect(self.stop_search)
+
+        layout.addWidget(self.quit_button)
+        self.quit_button.clicked.connect(self.quit_app)
 
         layout.addWidget(self.result_text)
 
@@ -33,106 +59,129 @@ class LibrarySearchApp(QWidget):
         self.show()
 
     def search_libraries(self):
-        location = self.location_input.text()
-        geolocator = Nominatim(user_agent="library_search_app")
-        current_location = geolocator.geocode(location)
-
+        # 여기에 자신의 크롬 드라이버 경로를 입력하세요.
+        self.driver = webdriver.Chrome('./driver/chromedriver')
         # Selenium을 사용하여 웹 스크레이핑을 수행하는 부분
-        try:
-            # 여기에 자신의 크롬 드라이버 경로를 입력하세요.
-            driver = webdriver.Chrome('./driver/chromedriver')
-            # 여기에 도서관 검색 웹사이트 주소를 입력하세요.
-            driver.get("https://www.nl.go.kr/kolisnet/index.do")
 
-            search_box = driver.find_element_by_xpath(
-                "//*[@id='simpleKeyword1']")
+        try:
+            self.driver.get("https://www.nl.go.kr/kolisnet/index.do")
+
+            search_box = self.driver.find_element_by_xpath("//*[@id='simpleKeyword1']")
             search_box.clear()
 
             search_keyword = self.location_input.text()  # 검색창에 입력된 텍스트를 검색어로 사용
             search_box.send_keys(search_keyword)
 
-            # 검색 버튼의 XPath로 변경하세요.
-            search_button = driver.find_element_by_xpath(
-                "//*[@id='simpleSearchBtn']")
+            search_button = self.driver.find_element_by_xpath("//*[@id='simpleSearchBtn']")  # 검색 버튼의 XPath로 변경하세요.
             search_button.click()
             time.sleep(1)  # 검색 결과 로딩 대기 (필요한 경우 대기 시간을 늘리세요)
 
-            # # 검색 결과를 가져와 출력합니다. 결과 요소의 XPath를 변경하세요.
-            # search_results = driver.find_elements_by_xpath("//*[@id='contents']/div/div/div[1]/section[1]")
-
-            # 모두 보기 버튼이 있는지 확인하고 클릭합니다.
-            view_all_buttons = driver.find_elements_by_xpath(
-                '//*[@id="contents"]/div/div/div[1]/section[1]/a')
+            view_all_buttons = self.driver.find_elements_by_xpath('//*[@id="contents"]/div/div/div[1]/section[1]/a')
             if len(view_all_buttons) > 0:
                 view_all_buttons[0].click()
-                time.sleep(1)  # 모든 결과 로딩 대기 (필요한 경우 대기 시간을 늘리세요)
-                # search_results = driver.find_elements_by_xpath("//*[@id='contents']/div/div/div[2]/section")
+                time.sleep(1)
 
             result_list = []
+            result_data = []
 
             current_page = 1
             real_page = 1
+
             while True:
 
-                search_results = driver.find_elements_by_xpath(
-                    "//*[@id='contents']/div/div/div[2]/section")  # 모두 보기 페이지에서의 XPath를 사용하세요.
+                # 웹 스크레이핑 작업을 중지하는지 확인
+                if self.web_scraper_thread is not None and self.web_scraper_thread.stop_requested:
+                    break
 
-                for result in search_results:
-                    result_list.append(result.text + "\n")
-                    result_list.append("페이지 번호 : " + str(real_page) + "\n")
-                    result_list.append(
-                        "===========================================\n")
+                search_results = self.driver.find_elements_by_xpath(
+                    "//*[@id='contents']/div/div/div[2]/section")
+                for i in range(1, 16):
+                    for result in search_results:
+                        try:
+                            title = result.find_element_by_css_selector(
+                                f"li:nth-child({i}) > div > p > a").text
+                            author_and_year = result.find_element_by_css_selector(
+                                f"li:nth-child({i}) > span").text
+                            library_info = result.find_element_by_css_selector(
+                                f"li:nth-child({i}) > div > div > p.own").text
 
-                # # 다음 페이지 번호를 계산하고, 다음 페이지 버튼을 찾습니다
+                            result_list.append(title + "\n" + author_and_year + "\n" + library_info + "\n")
+                            result_list.append("페이지 번호 : " + str(real_page) + "\n")
+                            result_list.append("===========================================\n")
+
+                            # Add the result data to the result_data list
+                            result_data.append({"Title": title, "Author and Publication": author_and_year,
+                                                "Library Info": library_info, "Page Number": real_page})
+                        except NoSuchElementException:
+                            pass
+
                 next_page_number = current_page + 1
-                print(next_page_number)
-                total_elements = driver.find_elements_by_xpath(
+                total_elements = self.driver.find_elements_by_xpath(
                     "//*[@id='contents']/div/div/div[2]/section/div/p/span/span")
                 if len(total_elements) > 0:
                     total_text = total_elements[0].text
                     total = int(total_text)
                 else:
                     total = 0
-
-                if current_page % 10 == 0:  # 페이지 번호가 10의 배수인 경우
-                    next_page_buttons = driver.find_elements_by_xpath(
-                        "//*[@id='contents']/div/div/div[2]/div/p/a[12]/img")  # '다음' 버튼의 XPath를 사용하세요.
+                if current_page % 10 == 0:
+                    next_page_buttons = self.driver.find_elements_by_xpath(
+                        "//*[@id='contents']/div/div/div[2]/div/p/a[12]/img")
                     if math.ceil(total / 15) != real_page:
-                        print("total" + str(total / 15))
-                        print("real" + str(real_page))
-                        print(math.ceil(15))
                         next_page_number = 1
                 else:
-                    next_page_buttons = driver.find_elements_by_xpath(
+                    next_page_buttons = self.driver.find_elements_by_xpath(
                         f"//*[@id='contents']/div/div/div[2]/div/p/a[{next_page_number+1}]")
 
-                    # 다음 페이지 버튼이 있으면 클릭하고, 없으면 종료합니다.
-                if len(next_page_buttons) > 0:
-                    # 다음 페이지 번호를 계산하고, 다음 페이지 버튼을 찾습니다
+                # 페이지 끝나면 종료되는 부분
+                if math.ceil(total / 15) != real_page:
                     next_page_buttons[0].click()
-                    time.sleep(1)  # 다음 페이지 로딩 대기 (필요한 경우 대기 시간을 늘리세요)
+                    time.sleep(1)
                     current_page = next_page_number
 
                 else:
                     break
-                # 현재 페이지에서 검색 결과를 가져와 출력합니다. 결과 요소의 XPath를 변경하세요.
+
                 real_page += 1
 
-            # 마지막 두 개의 요소를 제거합니다.
             if len(result_list) > 1:
                 for i in range(0, 6):
                     result_list.pop()
-                    print(i)
-            print(len(result_list))
 
             result_text = "".join(result_list)
             self.result_text.setPlainText(result_text)
-            driver.quit()
+
+            df = pd.DataFrame(result_data)
+
+            file_name, _ = QFileDialog.getSaveFileName(self, "Save File", "", "Excel Files (*.xlsx);;All Files (*)")
+
+            if file_name:
+                if not file_name.endswith(".xlsx"):
+                    file_name += ".xlsx"
+                df.to_excel(file_name, index=False)
+
+            if 'self.driver' in locals():
+                self.driver.quit()
 
         except Exception as e:
             self.result_text.setPlainText("검색 도중 오류가 발생했습니다.\n" + str(e))
-            if 'driver' in locals():
-                driver.quit()
+        if 'self.driver' in locals():
+            self.driver.quit()
+
+    def start_search(self):
+        self.web_scraper_thread = WebScraperThread(self)
+        self.web_scraper_thread.start()
+
+    def quit_app(self):  # 종료 버튼 클릭 이벤트 처리 함수
+        self.stop_search()
+        QCoreApplication.instance().quit()
+
+    def stop_search(self):
+        if self.driver:
+            self.driver.quit()
+            self.driver = None
+        if self.web_scraper_thread is not None:  # 추가
+            self.web_scraper_thread.terminate()
+            self.web_scraper_thread = None
 
 
 if __name__ == '__main__':
